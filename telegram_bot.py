@@ -1,16 +1,19 @@
 import logging
 import os
+import subprocess
 import sys
 import tempfile
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import requests
 import telebot
 import yt_dlp
 from dotenv import load_dotenv
-from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import ConnectionError as RequestsConnectionError, RequestException
 from telebot import types
 from telebot.apihelper import ApiTelegramException
 from yt_dlp.utils import DownloadError
@@ -19,13 +22,26 @@ from yt_dlp.utils import DownloadError
 load_dotenv()
 
 TELEGRAM_TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
+TELEGRAM_API_ID_ENV = "TELEGRAM_API_ID"
+TELEGRAM_API_HASH_ENV = "TELEGRAM_API_HASH"
 TELEGRAM_LOCAL_API_URL_ENV = "TELEGRAM_LOCAL_API_URL"
+TELEGRAM_LOCAL_SERVER_ENABLED_ENV = "TELEGRAM_LOCAL_SERVER_ENABLED"
+TELEGRAM_LOCAL_SERVER_TIMEOUT_ENV = "TELEGRAM_LOCAL_SERVER_TIMEOUT"
+TELEGRAM_LOCAL_SERVER_FORCE_REBUILD_ENV = "TELEGRAM_LOCAL_SERVER_FORCE_REBUILD"
 SUPPORTED_FORMATS = {"mp3", "mp4"}
 LOG_DIR = Path("logs")
 LOG_FILE = LOG_DIR / "bot.log"
-TELEGRAM_UPLOAD_LIMIT_BYTES = 49 * 1024 * 1024        # limite da API publica
-TELEGRAM_LOCAL_UPLOAD_LIMIT_BYTES = 2 * 1024 ** 3     # 2 GB — limite do servidor local
+TELEGRAM_UPLOAD_LIMIT_BYTES = 49 * 1024 * 1024
+TELEGRAM_LOCAL_UPLOAD_LIMIT_BYTES = 2000 * 1024 * 1024
 MP3_BITRATE_CHOICES = [192, 160, 128, 96, 64]
+DEFAULT_LOCAL_API_URL = "http://127.0.0.1:8081"
+DEFAULT_LOCAL_SERVER_TIMEOUT_SECONDS = 180
+LOCAL_SERVER_COMPOSE_FILE = Path("docker-compose.local-bot-api.yml")
+LOCAL_SERVER_SERVICE = "telegram-bot-api"
+LOCAL_SERVER_CONTAINER_NAME = "telegram-video-downloader-bot-api"
+CLOUD_BOT_API_BASE_URL = "https://api.telegram.org"
+DEFAULT_API_URL_TEMPLATE = telebot.apihelper.API_URL
+DEFAULT_FILE_URL_TEMPLATE = telebot.apihelper.FILE_URL
 
 LOG_DIR.mkdir(exist_ok=True)
 logger = logging.getLogger(__name__)
@@ -67,22 +83,200 @@ def get_bot_token() -> str:
     return token
 
 
+def get_required_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Defina {name} no ambiente ou no arquivo .env.")
+    return value
+
+
+def env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def is_local_server_enabled() -> bool:
+    return env_flag(TELEGRAM_LOCAL_SERVER_ENABLED_ENV) or bool(os.getenv(TELEGRAM_LOCAL_API_URL_ENV, "").strip())
+
+
 def get_local_api_url() -> str | None:
-    url = os.getenv(TELEGRAM_LOCAL_API_URL_ENV, "").strip()
-    return url or None
+    if not is_local_server_enabled():
+        return None
+    return os.getenv(TELEGRAM_LOCAL_API_URL_ENV, DEFAULT_LOCAL_API_URL).strip().rstrip("/")
+
+
+def get_local_server_timeout_seconds() -> int:
+    raw_value = os.getenv(TELEGRAM_LOCAL_SERVER_TIMEOUT_ENV, str(DEFAULT_LOCAL_SERVER_TIMEOUT_SECONDS)).strip()
+    try:
+        return max(10, int(raw_value))
+    except ValueError as exc:
+        raise RuntimeError(f"{TELEGRAM_LOCAL_SERVER_TIMEOUT_ENV} precisa ser um numero inteiro.") from exc
+
+
+def configure_bot_api_endpoints(base_url: str | None = None) -> None:
+    if base_url:
+        telebot.apihelper.API_URL = f"{base_url}/bot{{0}}/{{1}}"
+        telebot.apihelper.FILE_URL = f"{base_url}/file/bot{{0}}/{{1}}"
+        return
+    telebot.apihelper.API_URL = DEFAULT_API_URL_TEMPLATE
+    telebot.apihelper.FILE_URL = DEFAULT_FILE_URL_TEMPLATE
 
 
 def get_upload_limit() -> int:
-    return TELEGRAM_LOCAL_UPLOAD_LIMIT_BYTES if get_local_api_url() else TELEGRAM_UPLOAD_LIMIT_BYTES
+    if get_local_api_url():
+        return TELEGRAM_LOCAL_UPLOAD_LIMIT_BYTES
+    return TELEGRAM_UPLOAD_LIMIT_BYTES
 
 
 def create_bot(token: str | None = None) -> telebot.TeleBot:
+    return telebot.TeleBot(token or get_bot_token(), parse_mode=None)
+
+
+def get_bot_api_method_url(base_url: str, token: str, method: str) -> str:
+    return f"{base_url.rstrip('/')}/bot{token}/{method}"
+
+
+def call_bot_api(base_url: str, token: str, method: str, **payload: Any) -> dict[str, Any]:
+    response = requests.post(
+        get_bot_api_method_url(base_url, token, method),
+        data=payload or None,
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def ensure_local_server_credentials() -> None:
+    get_required_env(TELEGRAM_API_ID_ENV)
+    get_required_env(TELEGRAM_API_HASH_ENV)
+
+
+def run_local_server_compose(*compose_args: str) -> None:
+    if not LOCAL_SERVER_COMPOSE_FILE.exists():
+        raise RuntimeError(
+            f"Arquivo de compose nao encontrado: {LOCAL_SERVER_COMPOSE_FILE}. "
+            "Nao consigo iniciar o servidor Bot API local automaticamente."
+        )
+
+    command = ["docker", "compose", "-f", str(LOCAL_SERVER_COMPOSE_FILE), *compose_args]
+    try:
+        subprocess.run(
+            command,
+            check=True,
+            env=os.environ.copy(),
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("Docker ou Docker Compose nao esta disponivel neste ambiente.") from exc
+    except subprocess.CalledProcessError as exc:
+        message = f"Falha ao executar {' '.join(command)}."
+        raise RuntimeError(message) from exc
+
+
+def wait_for_local_server(base_url: str, timeout_seconds: int) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            response = requests.get(base_url, timeout=3)
+            if response.status_code < 500:
+                return
+        except RequestException as exc:
+            last_error = exc
+        time.sleep(1)
+
+    if last_error:
+        raise RuntimeError(f"O servidor Bot API local nao respondeu a tempo: {last_error}") from last_error
+    raise RuntimeError("O servidor Bot API local nao respondeu a tempo.")
+
+
+def get_local_server_container_state() -> str | None:
+    command = [
+        "docker",
+        "inspect",
+        LOCAL_SERVER_CONTAINER_NAME,
+        "--format",
+        "{{.State.Status}}|{{.State.ExitCode}}|{{.State.Error}}",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+    return completed.stdout.strip() or None
+
+
+def get_local_server_logs() -> str | None:
+    command = ["docker", "compose", "-f", str(LOCAL_SERVER_COMPOSE_FILE), "logs", "--tail=50", LOCAL_SERVER_SERVICE]
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+    logs = completed.stdout.strip()
+    return logs or None
+
+
+def ensure_cloud_logout(token: str) -> None:
+    try:
+        call_bot_api(CLOUD_BOT_API_BASE_URL, token, "deleteWebhook", drop_pending_updates="false")
+        result = call_bot_api(CLOUD_BOT_API_BASE_URL, token, "logOut")
+    except RequestException as exc:
+        raise RuntimeError("Falha ao fazer logOut do bot na API publica do Telegram.") from exc
+
+    if not result.get("ok"):
+        raise RuntimeError(f"Nao consegui fazer logOut do bot na API publica: {result.get('description') or result}")
+
+
+def start_local_server(token: str) -> str:
     local_url = get_local_api_url()
-    bot = telebot.TeleBot(token or get_bot_token(), parse_mode=None)
-    if local_url:
-        telebot.apihelper.API_URL = f"{local_url.rstrip('/')}/bot{{0}}/{{1}}"
-        telebot.apihelper.FILE_URL = f"{local_url.rstrip('/')}/file/bot{{0}}/{{1}}"
-    return bot
+    if not local_url:
+        configure_bot_api_endpoints(None)
+        return CLOUD_BOT_API_BASE_URL
+
+    ensure_local_server_credentials()
+    log_event("local_server_starting", url=local_url)
+    if env_flag(TELEGRAM_LOCAL_SERVER_FORCE_REBUILD_ENV):
+        logger.info("Reconstruindo o servidor Bot API local porque %s=1.", TELEGRAM_LOCAL_SERVER_FORCE_REBUILD_ENV)
+        run_local_server_compose("build", LOCAL_SERVER_SERVICE)
+    logger.info("Subindo o servidor Bot API local. Na primeira vez isso pode demorar alguns minutos.")
+    run_local_server_compose("up", "-d", LOCAL_SERVER_SERVICE)
+    logger.info("Servidor local iniciado no Docker. Aguardando responder em %s...", local_url)
+    try:
+        wait_for_local_server(local_url, get_local_server_timeout_seconds())
+    except RuntimeError as exc:
+        state = get_local_server_container_state()
+        logs = get_local_server_logs()
+        if state:
+            logger.error("Estado do container do servidor local: %s", state)
+        if logs:
+            logger.error("Ultimas linhas do servidor Bot API local:\n%s", logs)
+        raise RuntimeError(
+            "O servidor Bot API local nao ficou disponivel. "
+            "Verifique os logs acima do container 'telegram-bot-api'."
+        ) from exc
+    ensure_cloud_logout(token)
+    configure_bot_api_endpoints(local_url)
+    log_event("local_server_ready", url=local_url)
+    return local_url
+
+
+def stop_local_server() -> None:
+    local_url = get_local_api_url()
+    try:
+        if local_url:
+            run_local_server_compose("down", "--remove-orphans")
+            log_event("local_server_stopped", url=local_url)
+    finally:
+        configure_bot_api_endpoints(None)
 
 
 def is_valid_url(text: str) -> bool:
@@ -103,17 +297,17 @@ def format_size_label(size_bytes: int | None) -> str:
     return f"{size:.1f} {units[unit_index]}"
 
 
-def build_format_keyboard(size_estimates: dict[str, int | None] | None = None) -> types.InlineKeyboardMarkup:
+def build_playlist_download_keyboard(size_estimates: dict[str, int | None] | None = None) -> types.InlineKeyboardMarkup:
     size_estimates = size_estimates or {}
     markup = types.InlineKeyboardMarkup()
     markup.add(
         types.InlineKeyboardButton(
-            f"Baixar MP3 ({format_size_label(size_estimates.get('mp3'))})",
-            callback_data="fmt:mp3",
+            f"Baixar playlist em MP3 ({format_size_label(size_estimates.get('mp3'))})",
+            callback_data="dl:mp3",
         ),
         types.InlineKeyboardButton(
-            f"Baixar MP4 ({format_size_label(size_estimates.get('mp4'))})",
-            callback_data="fmt:mp4",
+            f"Baixar playlist em MP4 ({format_size_label(size_estimates.get('mp4'))})",
+            callback_data="dl:mp4",
         ),
     )
     return markup
@@ -319,22 +513,6 @@ def extract_audio_quality_label(info: dict[str, Any]) -> str | None:
     return "192kbps"
 
 
-def choose_mp3_bitrate(info: dict[str, Any], upload_limit_bytes: int | None = None) -> int | None:
-    limit = upload_limit_bytes if upload_limit_bytes is not None else get_upload_limit()
-    duration = info.get("duration")
-    for bitrate in MP3_BITRATE_CHOICES:
-        estimated_size = estimate_audio_size_for_bitrate(duration, bitrate)
-        if estimated_size and estimated_size <= limit:
-            return bitrate
-    return None
-
-
-def choose_mp4_format(info: dict[str, Any], upload_limit_bytes: int | None = None) -> dict[str, Any] | None:
-    choices = get_mp4_download_choices(info, upload_limit_bytes)
-    choices = [choice for choice in choices if choice["within_limit"]]
-    return choices[0] if choices else None
-
-
 def get_mp4_download_choices(info: dict[str, Any], upload_limit_bytes: int | None = None) -> list[dict[str, Any]]:
     limit = upload_limit_bytes if upload_limit_bytes is not None else get_upload_limit()
     formats = info.get("formats") or []
@@ -467,18 +645,6 @@ def resolve_output_path(download_dir: str, info: dict[str, Any], target_format: 
     raise FileNotFoundError("Nao foi possivel localizar o arquivo baixado.")
 
 
-def resolve_output_paths(download_dir: str, target_format: str) -> list[Path]:
-    expected_suffix = ".mp3" if target_format == "mp3" else ".mp4"
-    candidates = [
-        path
-        for path in Path(download_dir).iterdir()
-        if path.is_file()
-        and path.suffix.lower() == expected_suffix
-        and not path.name.endswith((".part", ".ytdl"))
-    ]
-    return sorted(candidates, key=lambda path: path.name)
-
-
 def is_playlist_info(info: dict[str, Any]) -> bool:
     return info.get("_type") == "playlist" and bool(info.get("entries"))
 
@@ -514,6 +680,14 @@ def summarize_link_info(info: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def has_download_metadata(info: dict[str, Any] | None) -> bool:
+    if not info:
+        return False
+    if info.get("formats"):
+        return True
+    return bool(info.get("duration")) and not is_playlist_info(info)
+
+
 def apply_download_plan(
     options: dict[str, Any],
     info: dict[str, Any],
@@ -525,10 +699,7 @@ def apply_download_plan(
         if not matching:
             raise ValueError("A opcao de MP3 escolhida nao esta mais disponivel.")
         if not matching["within_limit"]:
-            raise ValueError(
-                "Essa opcao de MP3 excede o limite da Bot API publica do Telegram. "
-                "Para arquivos grandes, so funciona bem usando um servidor Bot API local."
-            )
+            raise ValueError("Essa opcao de MP3 excede o limite atual de upload do Telegram. Escolha uma qualidade menor.")
         plan = {
             "target_format": "mp3",
             **matching,
@@ -563,9 +734,9 @@ def describe_download_plan(plan: dict[str, Any], target_format: str) -> str:
     estimated_size = format_size_label(plan.get("estimated_size"))
     within_limit = plan.get("within_limit", True)
     if target_format == "mp3":
-        return f"Vou tentar em MP3 a {plan['bitrate']} kbps. Tamanho estimado: {estimated_size}."
+        return f"MP3 {plan['bitrate']} kbps. Tamanho estimado: {estimated_size}."
     base = (
-        f"Vou tentar em MP4 com resolucao aproximada de {plan.get('height') or '?'}p. "
+        f"MP4 {plan.get('height') or '?'}p. "
         f"Tamanho estimado: {estimated_size}."
     )
     if not within_limit:
@@ -653,7 +824,8 @@ def send_download(
     notify_plan: bool = True,
 ) -> None:
     with tempfile.TemporaryDirectory(prefix="telegram_bot_") as download_dir:
-        info = info or inspect_link(link)
+        if not has_download_metadata(info):
+            info = inspect_link(link)
         ydl_opts = build_download_options(target_format, download_dir)
         plan, ydl_opts = apply_download_plan(ydl_opts, info, target_format, selected_value=selected_value)
         log_event("download_started", chat_id=chat_id, format=target_format, url=short_text(link))
@@ -689,7 +861,7 @@ def send_download(
             raise ValueError(
                 "O arquivo final ainda ficou maior que o limite do Telegram "
                 f"({format_size_label(output_path.stat().st_size)}). "
-                "Para videos grandes voce precisa de um servidor Bot API local."
+                "Tente novamente escolhendo uma qualidade menor."
             )
 
         with output_path.open("rb") as media_file:
@@ -808,7 +980,7 @@ def register_handlers(bot: telebot.TeleBot) -> telebot.TeleBot:
                         f"Itens encontrados: {link_data['entry_count']}\n"
                         "Escolha o formato abaixo para baixar e enviar item por item."
                     ),
-                    reply_markup=build_primary_download_keyboard(info),
+                    reply_markup=build_playlist_download_keyboard(link_data["size_estimates"]),
                 )
             else:
                 bot.send_message(
@@ -853,16 +1025,23 @@ def register_handlers(bot: telebot.TeleBot) -> telebot.TeleBot:
                     f"Itens encontrados: {link_data['entry_count']}\n"
                     "Escolha o formato abaixo para baixar e enviar item por item."
                 ) if link_data["kind"] == "playlist" else f"Video detectado: {link_data['title']}\nEscolha o formato abaixo:"
+                reply_markup = (
+                    build_playlist_download_keyboard(link_data["size_estimates"])
+                    if link_data["kind"] == "playlist"
+                    else build_primary_download_keyboard(link_data["info"])
+                )
                 bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=call.message.message_id,
                     text=text,
-                    reply_markup=build_primary_download_keyboard(link_data["info"]),
+                    reply_markup=reply_markup,
                 )
                 return
 
             callback_type, selected_format, *rest = call.data.split(":", 2)
             if callback_type == "fmt":
+                if link_data["kind"] == "playlist":
+                    raise ValueError("Selecao de qualidade detalhada esta disponivel apenas para links de video unico.")
                 bot.answer_callback_query(call.id, f"Escolhendo opcoes de {selected_format.upper()}...")
                 info = link_data["info"]
                 if selected_format == "mp3":
@@ -973,9 +1152,11 @@ def register_handlers(bot: telebot.TeleBot) -> telebot.TeleBot:
 
 
 def main() -> None:
-    bot = register_handlers(create_bot())
+    token = get_bot_token()
+    using_local_server = bool(get_local_api_url())
+    start_local_server(token)
+    bot = register_handlers(create_bot(token))
     me = bot.get_me()
-    local_url = get_local_api_url()
     logger.info("")
     logger.info("==============================================")
     logger.info("Bot iniciado com sucesso")
@@ -983,8 +1164,8 @@ def main() -> None:
     logger.info("Username: @%s", me.username)
     logger.info("ID: %s", me.id)
     logger.info("Status: aguardando mensagens no Telegram")
-    if local_url:
-        logger.info("Modo: servidor local (%s)", local_url)
+    if using_local_server:
+        logger.info("Modo: servidor Bot API local gerenciado (%s)", get_local_api_url())
     else:
         logger.info("Modo: API publica do Telegram")
     logger.info("Upload limit configurado: %s", format_size_label(get_upload_limit()))
@@ -1002,6 +1183,9 @@ def main() -> None:
         raise
     except KeyboardInterrupt:
         logger.info("Bot encerrado pelo usuario.")
+    finally:
+        if using_local_server:
+            stop_local_server()
 
 
 if __name__ == "__main__":

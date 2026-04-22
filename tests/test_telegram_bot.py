@@ -4,13 +4,16 @@ import unittest
 from pathlib import Path
 
 from telegram_bot import (
+    TELEGRAM_LOCAL_API_URL_ENV,
+    TELEGRAM_LOCAL_SERVER_ENABLED_ENV,
+    TELEGRAM_LOCAL_UPLOAD_LIMIT_BYTES,
     TELEGRAM_TOKEN_ENV,
+    TELEGRAM_UPLOAD_LIMIT_BYTES,
     build_download_options,
-    build_format_keyboard,
-    build_primary_download_keyboard,
     build_mp4_quality_keyboard,
-    choose_mp3_bitrate,
-    choose_mp4_format,
+    build_playlist_download_keyboard,
+    build_primary_download_keyboard,
+    describe_download_plan,
     estimate_download_sizes,
     estimate_single_download_sizes,
     format_size_label,
@@ -18,16 +21,33 @@ from telegram_bot import (
     extract_artist,
     extract_resolution_label,
     get_bot_token,
+    get_upload_limit,
     is_valid_url,
     is_playlist_info,
     resolve_output_path,
     sanitize_filename_stem,
     summarize_link_info,
-    TELEGRAM_UPLOAD_LIMIT_BYTES,
 )
 
 
 class TelegramBotHelpersTest(unittest.TestCase):
+    def setUp(self):
+        self._saved_env = {
+            TELEGRAM_LOCAL_SERVER_ENABLED_ENV: os.environ.get(TELEGRAM_LOCAL_SERVER_ENABLED_ENV),
+            TELEGRAM_LOCAL_API_URL_ENV: os.environ.get(TELEGRAM_LOCAL_API_URL_ENV),
+        }
+
+    def tearDown(self):
+        for name, value in self._saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    def disable_local_server(self):
+        os.environ.pop(TELEGRAM_LOCAL_SERVER_ENABLED_ENV, None)
+        os.environ.pop(TELEGRAM_LOCAL_API_URL_ENV, None)
+
     def test_is_valid_url_accepts_http_and_https(self):
         self.assertTrue(is_valid_url("https://example.com/video"))
         self.assertTrue(is_valid_url("http://example.com/video"))
@@ -81,13 +101,15 @@ class TelegramBotHelpersTest(unittest.TestCase):
         self.assertEqual(format_size_label(1024), "1.0 KB")
         self.assertEqual(format_size_label(5 * 1024 * 1024), "5.0 MB")
 
-    def test_build_format_keyboard_includes_estimates(self):
-        keyboard = build_format_keyboard({"mp3": 5 * 1024 * 1024, "mp4": 20 * 1024 * 1024})
+    def test_build_playlist_download_keyboard_includes_estimates(self):
+        keyboard = build_playlist_download_keyboard({"mp3": 5 * 1024 * 1024, "mp4": 20 * 1024 * 1024})
         buttons = keyboard.keyboard[0]
+        self.assertIn("playlist em MP3", buttons[0].text)
         self.assertIn("5.0 MB", buttons[0].text)
         self.assertIn("20.0 MB", buttons[1].text)
 
     def test_build_primary_download_keyboard_shows_best_first_and_other_options(self):
+        self.disable_local_server()
         info = {
             "duration": 100,
             "formats": [
@@ -206,28 +228,8 @@ class TelegramBotHelpersTest(unittest.TestCase):
         self.assertIsNotNone(estimates["mp3"])
         self.assertIsNotNone(estimates["mp4"])
 
-    def test_choose_mp3_bitrate_reduces_quality_to_fit_limit(self):
-        info = {"duration": 3085}
-        bitrate = choose_mp3_bitrate(info)
-        self.assertEqual(bitrate, 128)
-
-    def test_choose_mp4_format_selects_smaller_variant(self):
-        info = {
-            "duration": 100,
-            "formats": [
-                {"format_id": "137", "vcodec": "avc1", "acodec": "none", "ext": "mp4", "height": 1080, "tbr": 6000},
-                {"format_id": "136", "vcodec": "avc1", "acodec": "none", "ext": "mp4", "height": 720, "tbr": 2000},
-                {"format_id": "135", "vcodec": "avc1", "acodec": "none", "ext": "mp4", "height": 480, "tbr": 900},
-                {"format_id": "140", "vcodec": "none", "acodec": "mp4a.40.2", "ext": "m4a", "abr": 128},
-            ],
-        }
-        selected = choose_mp4_format(info, upload_limit_bytes=20 * 1024 * 1024)
-        self.assertIsNotNone(selected)
-        self.assertEqual(selected["format_selector"], "135+140")
-        self.assertLessEqual(selected["estimated_size"], 20 * 1024 * 1024)
-        self.assertTrue(selected["within_limit"])
-
     def test_build_mp4_quality_keyboard_shows_limited_and_unlimited_options(self):
+        self.disable_local_server()
         info = {
             "duration": 100,
             "formats": [
@@ -241,6 +243,32 @@ class TelegramBotHelpersTest(unittest.TestCase):
         texts = [button.text for row in keyboard.keyboard for button in row]
         self.assertTrue(any("1080p" in text and "[limite]" in text for text in texts))
         self.assertTrue(any("480p" in text and "[limite]" not in text for text in texts))
+
+    def test_public_upload_limit_constant(self):
+        self.assertEqual(TELEGRAM_UPLOAD_LIMIT_BYTES, 49 * 1024 * 1024)
+
+    def test_get_upload_limit_uses_public_limit_by_default(self):
+        self.disable_local_server()
+        self.assertEqual(get_upload_limit(), TELEGRAM_UPLOAD_LIMIT_BYTES)
+
+    def test_get_upload_limit_uses_local_limit_when_enabled(self):
+        previous = os.environ.get(TELEGRAM_LOCAL_SERVER_ENABLED_ENV)
+        os.environ[TELEGRAM_LOCAL_SERVER_ENABLED_ENV] = "1"
+        try:
+            self.assertEqual(get_upload_limit(), TELEGRAM_LOCAL_UPLOAD_LIMIT_BYTES)
+        finally:
+            if previous is None:
+                os.environ.pop(TELEGRAM_LOCAL_SERVER_ENABLED_ENV, None)
+            else:
+                os.environ[TELEGRAM_LOCAL_SERVER_ENABLED_ENV] = previous
+
+    def test_describe_download_plan_is_direct_for_mp3(self):
+        text = describe_download_plan({"bitrate": 160, "estimated_size": 5 * 1024 * 1024}, "mp3")
+        self.assertEqual(text, "MP3 160 kbps. Tamanho estimado: 5.0 MB.")
+
+    def test_describe_download_plan_is_direct_for_mp4(self):
+        text = describe_download_plan({"height": 720, "estimated_size": 20 * 1024 * 1024, "within_limit": True}, "mp4")
+        self.assertEqual(text, "MP4 720p. Tamanho estimado: 20.0 MB.")
 
 
 if __name__ == "__main__":

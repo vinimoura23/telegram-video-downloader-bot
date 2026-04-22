@@ -1,52 +1,106 @@
 # Telegram Video Downloader Bot
 
-Bot de Telegram para receber links de video e oferecer download em `MP3` ou `MP4` usando `yt-dlp`.
+Bot de Telegram para baixar audio em `MP3` ou video em `MP4` usando `yt-dlp`.
 
-## Funcionalidades atuais
+## O que ele faz
 
-- Recebe links enviados por mensagem.
-- Valida se a mensagem parece uma URL `http` ou `https`.
-- Detecta se o link e um video unico ou uma playlist.
-- Mostra botoes para baixar em `MP3` ou `MP4`.
-- Usa `yt-dlp` para baixar o conteudo.
-- Converte audio para `MP3` com `FFmpeg`.
-- Envia playlists item por item no formato escolhido.
-- Prioriza `MP4` em boa qualidade, preferindo video `mp4` com audio `m4a` quando disponivel.
-- Envia o arquivo de volta no Telegram e limpa arquivos temporarios.
-- Responde `/start`, `/help` e `ping`.
+- recebe um link por mensagem;
+- detecta se o link e um video unico ou uma playlist;
+- para video unico, oferece `MP3`, `MP4` e outras qualidades;
+- para playlist, baixa e envia item por item;
+- pode rodar na API publica do Telegram ou com Bot API local.
 
 ## Requisitos
 
-- Python `3.8+`
-- `ffmpeg` instalado no sistema para a opcao `MP3`
-- Token de bot do Telegram
+- Python 3.8+
+- `ffmpeg`
+- token do bot no Telegram
+- Docker com `docker compose` se quiser usar servidor local
 
-## Ambiente virtual
+## Instalar
 
 ```bash
+git clone git@github.com:vinimoura23/telegram-video-downloader-bot.git
+cd telegram-video-downloader-bot
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Configuracao
+## Configurar
 
-Crie um arquivo `.env` na raiz do projeto:
+Crie o `.env` a partir do exemplo:
+
+```bash
+cp .env.example .env
+```
+
+Preencha pelo menos:
 
 ```env
 TELEGRAM_BOT_TOKEN=seu_token_aqui
 ```
 
-## Execucao
+## Modos de execucao
+
+### 1. Modo simples
+
+Usa a API publica do Telegram.
+
+Limite pratico de upload: `49 MB`.
+
+No `.env`:
+
+```env
+TELEGRAM_LOCAL_SERVER_ENABLED=0
+```
+
+### 2. Modo local
+
+Usa o servidor oficial Bot API local do Telegram, iniciado junto com o bot.
+
+Limite pratico de upload: ate `2000 MB`.
+
+No `.env`:
+
+```env
+TELEGRAM_API_ID=seu_api_id
+TELEGRAM_API_HASH=seu_api_hash
+TELEGRAM_LOCAL_SERVER_ENABLED=1
+TELEGRAM_LOCAL_API_URL=http://127.0.0.1:8081
+TELEGRAM_LOCAL_SERVER_TIMEOUT=180
+```
+
+Notas:
+
+- na primeira execucao o Docker pode demorar alguns minutos para compilar o servidor local;
+- nas proximas execucoes ele reutiliza a imagem ja criada;
+- se quiser forcar rebuild: `TELEGRAM_LOCAL_SERVER_FORCE_REBUILD=1`.
+
+## Rodar
 
 ```bash
 source .venv/bin/activate
 python telegram_bot.py
 ```
 
-## Testes
+## Testar
 
 ```bash
 source .venv/bin/activate
 python -m unittest discover -s tests
 ```
+
+## Uso
+
+No Telegram:
+
+1. envie um link;
+2. escolha `MP3` ou `MP4`;
+3. se for video unico, use os botoes de qualidade quando quiser.
+
+## Observacoes
+
+- `logs/bot.log` e usado apenas para diagnostico local;
+- o bot limpa arquivos temporarios apos cada envio;
+- playlist pode demorar mais porque cada item e processado separadamente.

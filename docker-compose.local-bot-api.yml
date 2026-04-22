@@ -1,0 +1,21 @@
+services:
+  telegram-bot-api:
+    build:
+      context: .
+      dockerfile: docker/telegram-bot-api/Dockerfile
+    container_name: telegram-video-downloader-bot-api
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+    command:
+      - --local
+      - --http-port=8081
+      - --dir=/var/lib/telegram-bot-api
+      - --temp-dir=/var/lib/telegram-bot-api/tmp
+    ports:
+      - 127.0.0.1:8081:8081
+    volumes:
+      - telegram-bot-api-data:/var/lib/telegram-bot-api
+
+volumes:
+  telegram-bot-api-data:
